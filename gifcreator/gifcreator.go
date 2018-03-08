@@ -13,34 +13,36 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- 
+
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
 	"image/gif"
 	"image/png"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"time"
-	"bytes"
 	"text/template"
+	"time"
 
 	"gopkg.in/redis.v5"
 
-	pb "github.com/GoogleCloudPlatform/k8s-render-demo/proto"
-	"github.com/GoogleCloudPlatform/k8s-render-demo/internal/gcsref"
+	"github.com/GoogleCloudPlatform/gifinator/internal/gcsref"
+	pb "github.com/GoogleCloudPlatform/gifinator/proto"
+	"github.com/bradfitz/slice"
+	"github.com/golang/freetype"
+	"golang.org/x/image/font/gofont/gobold"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-  "golang.org/x/image/font/gofont/gobold"
-	"github.com/golang/freetype"
-	"github.com/bradfitz/slice"
 
 	"cloud.google.com/go/storage"
 	"cloud.google.com/go/trace"
@@ -66,8 +68,8 @@ type renderTask struct {
 var (
 	redisClient   *redis.Client
 	renderClient  pb.RenderClient
-	scenePath			string
-	deploymentId	string
+	scenePath     string
+	deploymentId  string
 	workerMode    = flag.Bool("worker", false, "run in worker mode rather than server")
 	traceClient   *trace.Client
 	gcsBucketName string
@@ -79,7 +81,7 @@ func transform(inputPath string, jobId string) (bytes.Buffer, error) {
 	if err != nil {
 		return transformed, err
 	}
-  err = tmpl.Execute(&transformed, jobId)
+	err = tmpl.Execute(&transformed, jobId)
 	if err != nil {
 		return transformed, err
 	}
@@ -97,22 +99,33 @@ func upload(outBytes []byte, outputPath string, mimeType string, client *storage
 	return nil
 }
 
+func checkResource(context context.Context, outputPath string, client *storage.Client) bool {
+	obj, _ := gcsref.Parse(outputPath)
+	//	rc, err := client.Bucket(string(obj.Bucket)).Object(obj.Name).NewReader(context)
+	_, err := client.Bucket(string(obj.Bucket)).Object(obj.Name).Attrs(context)
+	//defer attr.Close()
+	if err != nil {
+		return false
+	}
+	return true
+}
+
 func addLabel(img *image.NRGBA, x, y int, label string) error {
-	  fontSize := float64(120)
-		f, err := freetype.ParseFont(gobold.TTF)
-		if err != nil {
-			return err
-		}
-		c := freetype.NewContext()
-		c.SetDPI(float64(72))
-		c.SetFont(f)
-		c.SetFontSize(fontSize)
-		c.SetClip(img.Bounds())
-		c.SetDst(img)
-		c.SetSrc(img)
-		pt := freetype.Pt(x, y+int(c.PointToFixed(fontSize)>>6))
-		_, err = c.DrawString(label, pt)
+	fontSize := float64(120)
+	f, err := freetype.ParseFont(gobold.TTF)
+	if err != nil {
 		return err
+	}
+	c := freetype.NewContext()
+	c.SetDPI(float64(72))
+	c.SetFont(f)
+	c.SetFontSize(fontSize)
+	c.SetClip(img.Bounds())
+	c.SetDst(img)
+	c.SetSrc(img)
+	pt := freetype.Pt(x, y+int(c.PointToFixed(fontSize)>>6))
+	_, err = c.DrawString(label, pt)
+	return err
 }
 
 func (server) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJobResponse, error) {
@@ -138,10 +151,10 @@ func (server) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJ
 		return nil, err
 	}
 
-  gcsClient, err := storage.NewClient(ctx)
+	gcsClient, err := storage.NewClient(ctx)
 
-  var productString string
-	switch(req.ProductToPlug){
+	var productString string
+	switch req.ProductToPlug {
 	case pb.Product_GRPC:
 		productString = "grpc"
 		break
@@ -158,7 +171,7 @@ func (server) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJ
 		return nil, err
 	}
 	err = upload(t.Bytes(),
-		"gs://" + gcsBucketName + "/job_"+jobIdStr+".obj",
+		"gs://"+gcsBucketName+"/job_"+jobIdStr+".obj",
 		"binary/octet-stream", gcsClient, ctx)
 	if err != nil {
 		return nil, err
@@ -168,12 +181,12 @@ func (server) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJ
 		return nil, err
 	}
 	err = upload(t.Bytes(),
-		"gs://" + gcsBucketName + "/job_"+jobIdStr+".mtl",
+		"gs://"+gcsBucketName+"/job_"+jobIdStr+".mtl",
 		"binary/octet-stream", gcsClient, ctx)
 	if err != nil {
 		return nil, err
 	}
-	badgeFile, err := os.Open(scenePath+"/gcp_next_badge.png")
+	badgeFile, err := os.Open(scenePath + "/gcp_next_badge.png")
 	if err != nil {
 		return nil, err
 	}
@@ -183,17 +196,17 @@ func (server) StartJob(ctx context.Context, req *pb.StartJobRequest) (*pb.StartJ
 	}
 	addLabel(badgeImg.(*image.NRGBA), 90, 120, req.Name)
 	buf := new(bytes.Buffer)
-  err = png.Encode(buf, badgeImg)
+	err = png.Encode(buf, badgeImg)
 	err = upload(buf.Bytes(),
-		"gs://" + gcsBucketName + "/job_"+jobIdStr+"_badge.png",
-	  "image/png", gcsClient, ctx)
+		"gs://"+gcsBucketName+"/job_"+jobIdStr+"_badge.png",
+		"image/png", gcsClient, ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// Add tasks to the GifJob queue for each frame to render
 	var taskId int64
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 35; i++ {
 		// Set up render request for each frame
 		var task = renderTask{
 			Frame:       int64(i),
@@ -238,10 +251,10 @@ func leaseNextTask() error {
 	 * collector could move the task back into the 'queueing' queue.
 	 */
 	span := traceClient.NewSpan("gifCreator.leaseNextTask")
- 	span.SetLabel("service", serviceName)
- 	span.SetLabel("version", deploymentId)
- 	tCtx := trace.NewContext(context.Background(), span)
- 	defer span.Finish()
+	span.SetLabel("service", serviceName)
+	span.SetLabel("version", deploymentId)
+	tCtx := trace.NewContext(context.Background(), span)
+	defer span.Finish()
 
 	jobString, err := redisClient.BRPopLPush("gifjob_queued", "gifjob_processing", 0).Result()
 	if err != nil {
@@ -270,14 +283,14 @@ func leaseNextTask() error {
 	outputBasePath := "gs://" + gcsBucketName + "/" + outputPrefix
 	req := &pb.RenderRequest{
 		GcsOutputBase: outputBasePath,
-		ObjPath: "gs://" + gcsBucketName + "/job_"+jobIdStr+".obj",
+		ObjPath:       "gs://" + gcsBucketName + "/job_" + jobIdStr + ".obj",
 		Assets: []string{
-			"gs://" + gcsBucketName + "/job_"+jobIdStr+".mtl",
-			"gs://" + gcsBucketName + "/job_"+jobIdStr+"_badge.png",
+			"gs://" + gcsBucketName + "/job_" + jobIdStr + ".mtl",
+			"gs://" + gcsBucketName + "/job_" + jobIdStr + "_badge.png",
 			"gs://" + gcsBucketName + "/k8s.png",
 			"gs://" + gcsBucketName + "/grpc.png",
 		},
-		Rotation: float32(task.Frame*2+20),
+		Rotation:   float32(task.Frame*2 + 20),
 		Iterations: 1,
 	}
 	_, err =
@@ -341,7 +354,7 @@ func compileGifs(prefix string, tCtx context.Context) (string, error) {
 	}
 	it := gcsClient.Bucket(gcsBucketName).Objects(tCtx, &storage.Query{Prefix: prefix, Versions: false})
 	// Results from GCS are unordered, so pull the list into memory and sort it
-  var orderedObjects []storage.ObjectAttrs
+	var orderedObjects []storage.ObjectAttrs
 	for {
 		obj, err := it.Next()
 		if err == iterator.Done {
@@ -350,8 +363,8 @@ func compileGifs(prefix string, tCtx context.Context) (string, error) {
 		orderedObjects = append(orderedObjects, *obj)
 	}
 	slice.Sort(orderedObjects[:], func(i, j int) bool {
-    return orderedObjects[i].Name < orderedObjects[j].Name
-  })
+		return orderedObjects[i].Name < orderedObjects[j].Name
+	})
 
 	finalGif := &gif.GIF{}
 	for _, objAttrs := range orderedObjects {
@@ -372,9 +385,9 @@ func compileGifs(prefix string, tCtx context.Context) (string, error) {
 			return "", err
 		}
 
-    var gifBuf bytes.Buffer
+		var gifBuf bytes.Buffer
 		var opt gif.Options
-	  opt.NumColors = 256
+		opt.NumColors = 256
 		err = gif.Encode(&gifBuf, framePng, &opt)
 
 		frameGif, err := gif.Decode(&gifBuf)
@@ -443,7 +456,7 @@ func main() {
 	renderName := os.Getenv("RENDER_NAME")
 	renderPort := os.Getenv("RENDER_PORT")
 	renderHostAddr := renderName + ":" + renderPort
-  deploymentId = os.Getenv("DEPLOYMENT_ID")
+	deploymentId = os.Getenv("DEPLOYMENT_ID")
 	gcsBucketName = os.Getenv("GCS_BUCKET_NAME")
 	scenePath = os.Getenv("SCENE_PATH")
 
@@ -488,6 +501,27 @@ func main() {
 		l, err := net.Listen("tcp", ":"+port)
 		if err != nil {
 			log.Fatalf("listen failed: %v", err)
+		}
+		fmt.Println("yoyoyo1")
+		// upload some assets
+		ctx := context.Background()
+		gcsClient, err := storage.NewClient(ctx)
+
+		for _, res := range []string{"k8s.png", "grpc.png"} {
+			asset := "gs://" + gcsBucketName + "/" + res
+			file := scenePath + "/" + res
+
+			if !checkResource(ctx, asset, gcsClient) {
+				file, err := os.Open(file)
+				if err != nil {
+					fmt.Println("failed to open asset", file)
+				}
+				reader := bufio.NewReader(file)
+				blob, err := ioutil.ReadAll(reader)
+				upload(blob, asset, "image/png", gcsClient, ctx)
+				fmt.Println("finished uploading asset: ", asset)
+			}
+
 		}
 		srv := grpc.NewServer()
 		pb.RegisterGifCreatorServer(srv, server{})

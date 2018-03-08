@@ -18,37 +18,38 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
-	"math/rand"
-	"io/ioutil"
 
 	"cloud.google.com/go/storage"
 	"github.com/GoogleCloudPlatform/gifinator/internal/gcsref"
 	pb "github.com/GoogleCloudPlatform/gifinator/proto"
+	"github.com/fogleman/pt/pt"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"github.com/fogleman/pt/pt"
 )
 
 type server struct{}
 
 var (
-	gcsClient *storage.Client
+	gcsClient   *storage.Client
 	gcsCacheDir string
 )
 
 func cacheGcsObject(ctx context.Context, obj gcsref.Object) (string, error) {
 	// TODO(jessup) This will have collisions! Fix.
-	localFilepath := gcsCacheDir+"/"+obj.Name
+	localFilepath := gcsCacheDir + "/" + obj.Name
 
-  // TODO(jessup) Check if file exists before pulling from disk
+	// TODO(jessup) Check if file exists before pulling from disk
 	fmt.Fprintf(os.Stdout, "DEBUG %s: %s", string(obj.Bucket), obj.Name)
 
 	rc, err := gcsClient.Bucket(string(obj.Bucket)).Object(obj.Name).NewReader(ctx)
 	if err != nil {
+		fmt.Println("yo damn it!!!")
 		fmt.Fprintf(os.Stderr, "error creating reader for %s/%s %v", string(obj.Bucket), obj.Name, err)
 		return "", err
 	}
@@ -56,13 +57,13 @@ func cacheGcsObject(ctx context.Context, obj gcsref.Object) (string, error) {
 
 	// TODO(jessup) Fix this to read incrementally and not store files in memory
 	slurp, err := ioutil.ReadAll(rc)
-  if err != nil {
-    fmt.Fprintf(os.Stderr, "readFile: unable to read data from bucket %q, file %q: %v", obj.Bucket, localFilepath, err)
-    return "", err
-  }
-  fmt.Fprintf(os.Stdout, "writing file %q\n", localFilepath)
-  err = ioutil.WriteFile(localFilepath, slurp, 0777)
-  if err != nil {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "readFile: unable to read data from bucket %q, file %q: %v", obj.Bucket, localFilepath, err)
+		return "", err
+	}
+	fmt.Fprintf(os.Stdout, "writing file %q\n", localFilepath)
+	err = ioutil.WriteFile(localFilepath, slurp, 0777)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error while writing file %q: %v\n", localFilepath, err)
 		return "", err
 	}
@@ -74,7 +75,7 @@ func renderImage(objectPath string, rotation float64, iterations int32) (string,
 	scene := pt.Scene{}
 
 	// create materials
-  objMat := pt.GlossyMaterial(pt.Black, 1.2, pt.Radians(30))
+	objMat := pt.GlossyMaterial(pt.Black, 1.2, pt.Radians(30))
 	wall := pt.GlossyMaterial(pt.HexColor(0xFCFAE1), 1.5, pt.Radians(10))
 	light := pt.LightMaterial(pt.White, 80)
 
@@ -102,40 +103,39 @@ func renderImage(objectPath string, rotation float64, iterations int32) (string,
 	sampler := pt.NewSampler(16, 16)
 	renderer := pt.NewRenderer(&scene, &camera, sampler, 300, 300)
 
-  // TODO(jessup) Fix this for better entropy
+	// TODO(jessup) Fix this for better entropy
 	imagePath := os.TempDir() + "/final_img_itr_%d_" + strconv.FormatInt(int64(rand.Intn(10000)), 16) + ".png"
 	renderer.IterativeRender(imagePath, int(iterations))
 
 	return fmt.Sprintf(imagePath, iterations), nil
 }
 
-
 func (server) RenderFrame(ctx context.Context, req *pb.RenderRequest) (*pb.RenderResponse, error) {
 	gcsClient, _ = storage.NewClient(ctx)
 
 	fmt.Fprintf(os.Stdout, "starting render job - object: %s, angle: %f\n", req.ObjPath, req.Rotation)
 
-  // Load main object file
+	// Load main object file
 	objGcsObj, _ := gcsref.Parse(req.ObjPath)
-  objFilepath, err := cacheGcsObject(ctx, objGcsObj)
+	objFilepath, err := cacheGcsObject(ctx, objGcsObj)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error caching %s, err: %v\n", req.ObjPath, err)
 		return nil, err
 	}
 
 	// Load the assets
-  for _,element := range req.Assets {
+	for _, element := range req.Assets {
 		assetGcsObj, _ := gcsref.Parse(element)
-	  _, err := cacheGcsObject(ctx, assetGcsObj)
+		_, err := cacheGcsObject(ctx, assetGcsObj)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error caching %s, err: %v\n", req.ObjPath, err)
 			return nil, err
 		}
 	}
 
-  // Create and render a scene seeded with the object we loaded
+	// Create and render a scene seeded with the object we loaded
 	fmt.Fprintf(os.Stdout, "starting actual render - object: %s, angle: %f\n", req.ObjPath, req.Rotation)
-  imgPath, err := renderImage(objFilepath, float64(req.Rotation), req.Iterations)
+	imgPath, err := renderImage(objFilepath, float64(req.Rotation), req.Iterations)
 
 	fmt.Fprintf(os.Stdout, "finshed actual render - object: %s, angle: %f\n", req.ObjPath, req.Rotation)
 
@@ -144,13 +144,13 @@ func (server) RenderFrame(ctx context.Context, req *pb.RenderRequest) (*pb.Rende
 	gcsFinalImageObj, err := gcsref.Parse(gcsPath)
 
 	wc := gcsClient.Bucket(string(gcsFinalImageObj.Bucket)).Object(gcsFinalImageObj.Name).NewWriter(ctx)
-  defer wc.Close()
+	defer wc.Close()
 
 	wc.ObjectAttrs.ContentType = "image/png"
 	fmt.Fprintf(os.Stdout, "starting writing frame: %s from %s, frame: %f\n", gcsPath, imgPath, req.Rotation)
 
 	// TODO(jessup) Do this iteratively to save memory
-  contents, err := ioutil.ReadFile(imgPath)
+	contents, err := ioutil.ReadFile(imgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading file %s, err: %v\n", imgPath, err)
 		return nil, err
@@ -178,7 +178,7 @@ func main() {
 		log.Fatalf("listen failed: %v", err)
 		return
 	}
-	gcsCacheDir	= os.TempDir()
+	gcsCacheDir = os.TempDir()
 
 	srv := grpc.NewServer()
 	pb.RegisterRenderServer(srv, server{})
